@@ -335,3 +335,7 @@ See [docs/features.md](docs/features.md) for the full capability and limitation 
 > ExecutionPublisher hands off.
 >
 > This is a Decision OS Kernel.
+
+## License
+
+MIT License
