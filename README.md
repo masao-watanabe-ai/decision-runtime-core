@@ -9,7 +9,9 @@ Turn AI outputs into reproducible, controllable decisions.
 
 The Decision Runtime Core is a **Decision OS Kernel** — a production-grade runtime layer that sits between AI signal producers and execution systems.
 
-It solves the fundamental gap in AI-powered products: **AI generates signals, not decisions.** A signal is a probability. A decision is an accountable, traceable, governed act. This runtime turns one into the other.
+It solves the fundamental gap in AI-powered products: **AI generates signals, not decisions.** A signal is a probability. A decision is an accountable, traceable, governed act. This runtime is the single point where signals are evaluated and decisions are finalized.
+
+AI produces signals. Only the runtime produces decisions.
 
 ### Core responsibilities
 
@@ -45,7 +47,7 @@ Without a decision layer:
 The Decision Trace Model:
 
 ```
-Event → Signal → Decision → Boundary → Human → Log
+Event → Signal → Decision (Runtime) → Boundary → Human → Log
 ```
 
 Every decision flows through the same pipeline:
