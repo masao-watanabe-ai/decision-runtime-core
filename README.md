@@ -280,3 +280,7 @@ Next:
   - Authentication and role-based gate assignment
   - Metrics and observability (Prometheus / OpenTelemetry)
 ```
+
+## License
+
+MIT License © 2026 Masao Watanabe
