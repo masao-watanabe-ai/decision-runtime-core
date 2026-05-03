@@ -5,10 +5,30 @@ services:
       - "8002:8000"
     env_file:
       - .env
+    environment:
+      - LEDGER_DATABASE_URL=postgresql://ledger:ledger@postgres:5432/ledger
+      - REDIS_URL=redis://redis:6379
+      - REDIS_EVENT_STREAM=runtime:events
     depends_on:
       - redis
+      - postgres
 
   redis:
     image: redis:7
     ports:
       - "6379:6379"
+
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docs/sql/ledger_events.sql:/docker-entrypoint-initdb.d/01_ledger_events.sql
+
+volumes:
+  postgres_data:

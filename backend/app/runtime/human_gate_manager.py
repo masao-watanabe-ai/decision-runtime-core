@@ -26,6 +26,10 @@ class HumanGateInvalidStateError(Exception):
     """Raised when an action is attempted on a gate request in the wrong state."""
 
 
+class HumanGateInsufficientRoleError(Exception):
+    """Raised when the actor does not hold the required_role for a gate."""
+
+
 _APPROVE_OPTION = HumanGateOption(
     value="approve",
     label="Approve",
@@ -91,6 +95,7 @@ class HumanGateManager:
         request_id: str,
         actor_id: str,
         comment: Optional[str] = None,
+        actor_roles: list[str] | None = None,
     ) -> DecisionResult:
         """Approve a pending gate request; transitions the DecisionResult to confirmed.
 
@@ -103,11 +108,13 @@ class HumanGateManager:
             Updated DecisionResult with status=confirmed and state=confirmed.
 
         Raises:
-            HumanGateNotFoundError:    If request_id is not in the store.
-            HumanGateInvalidStateError: If the request is not in PENDING state.
+            HumanGateNotFoundError:       If request_id is not in the store.
+            HumanGateInvalidStateError:   If the request is not in PENDING state.
+            HumanGateInsufficientRoleError: If actor_roles does not include required_role.
         """
         request = self._get_request(request_id)
         self._require_pending(request)
+        self._require_role(request, actor_roles)
 
         now = datetime.now(timezone.utc)
         self._store[request_id] = request.model_copy(
@@ -134,6 +141,7 @@ class HumanGateManager:
         request_id: str,
         actor_id: str,
         comment: Optional[str] = None,
+        actor_roles: list[str] | None = None,
     ) -> DecisionResult:
         """Reject a pending gate request; transitions the DecisionResult to rejected.
 
@@ -146,11 +154,13 @@ class HumanGateManager:
             Updated DecisionResult with status=rejected, state=rejected, action=None.
 
         Raises:
-            HumanGateNotFoundError:    If request_id is not in the store.
-            HumanGateInvalidStateError: If the request is not in PENDING state.
+            HumanGateNotFoundError:       If request_id is not in the store.
+            HumanGateInvalidStateError:   If the request is not in PENDING state.
+            HumanGateInsufficientRoleError: If actor_roles does not include required_role.
         """
         request = self._get_request(request_id)
         self._require_pending(request)
+        self._require_role(request, actor_roles)
 
         now = datetime.now(timezone.utc)
         self._store[request_id] = request.model_copy(
@@ -199,3 +209,12 @@ class HumanGateManager:
                 f"HumanGateRequest '{request.id}' is in state "
                 f"'{request.status.value}'; only PENDING requests can be resolved"
             )
+
+    def _require_role(self, request: HumanGateRequest, actor_roles: list[str] | None) -> None:
+        if request.required_role is not None:
+            roles = actor_roles or []
+            if request.required_role not in roles:
+                raise HumanGateInsufficientRoleError(
+                    f"Role '{request.required_role}' required to resolve "
+                    f"gate '{request.id}'"
+                )

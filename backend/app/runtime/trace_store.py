@@ -67,3 +67,20 @@ class TraceStore:
                 f"No trace found for decision '{decision_id}'"
             )
         return trace
+
+    def list_recent(self, limit: int = 1000) -> list[DecisionTrace]:
+        """Return up to ``limit`` traces sorted by started_at descending (newest first).
+
+        Args:
+            limit: Maximum number of traces to return.  Capped at 10 000.
+
+        Returns:
+            Traces in reverse chronological order; empty list when the store is empty.
+        """
+        limit = min(limit, 10_000)
+        traces = sorted(
+            self._by_trace_id.values(),
+            key=lambda t: t.started_at,
+            reverse=True,
+        )
+        return traces[:limit]

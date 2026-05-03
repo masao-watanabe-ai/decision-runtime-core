@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Union
+from typing import Any, Optional, Union
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -64,6 +64,11 @@ class Signal(BaseModel):
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         description="Wall-clock time when the signal was emitted at its source",
+    )
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=512,
+        description="Caller-supplied key for idempotent evaluation; used by the engine to recover from Ledger DUPLICATE responses",
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,

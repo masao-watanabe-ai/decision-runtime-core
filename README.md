@@ -1,28 +1,30 @@
 # Decision Runtime Core
 
 **AI is not prediction. It is decision.**
-Turn AI outputs into reproducible, controllable decisions.
 
 ---
 
 ## What this is
 
-The Decision Runtime Core is a **Decision OS Kernel** — a production-grade runtime layer that sits between AI signal producers and execution systems.
+The Decision Runtime Core is a **Decision OS Kernel** — a production-grade runtime that sits between AI signal producers and execution systems.
 
-It solves the fundamental gap in AI-powered products: **AI generates signals, not decisions.** A signal is a probability. A decision is an accountable, traceable, governed act. This runtime is the single point where signals are evaluated and decisions are finalized.
+AI models output signals: probabilities, classifications, scores. Those are not decisions. A decision is an accountable, traceable, governed act — one that routes a customer, approves a transaction, or holds a shipment. This runtime turns signals into decisions.
 
-AI produces signals. Only the runtime produces decisions.
+```
+[ Signal Source ]           e.g. AI model, user event, sensor
+        ↓
+[ Decision Runtime Engine ] evaluate → boundary → human gate
+        ↓
+[ Ledger (Postgres) ]       append-only commit of every decision fact
+        ↓
+[ EventBus (Redis Streams) ] publish confirmed decisions
+        ↓
+[ ExecutionPublisher (Kafka) ] hand off to external orchestrator
+        ↓
+[ External Orchestrator ]   act on confirmed decisions
+```
 
-### Core responsibilities
-
-| Layer | What it does |
-|---|---|
-| **Signal ingestion** | Accepts typed, confidence-scored signals from upstream systems |
-| **Decision evaluation** | Evaluates signals against declarative flow definitions |
-| **Boundary enforcement** | Applies block / override / escalate / redirect rules |
-| **Human gating** | Suspends decisions pending human review when required |
-| **Trace & explain** | Records every evaluation step for audit and replay |
-| **Execution request** | Emits a typed event when a confirmed decision is ready to act |
+Full architecture: [docs/architecture-runtime.md](docs/architecture-runtime.md)
 
 ---
 
@@ -36,7 +38,7 @@ Without a decision layer:
 
 - AI outputs are executed without governance
 - There is no audit trail when something goes wrong
-- Human review is bolted on after the fact, inconsistently
+- Human review is bolted on inconsistently after the fact
 - Replaying or explaining a past decision is impossible
 - Boundary violations are caught by production systems, not policy
 
@@ -44,70 +46,77 @@ Without a decision layer:
 
 ## The solution
 
-The Decision Trace Model:
-
-```
-Event → Signal → Decision (Runtime) → Boundary → Human → Log
-```
-
-Every decision flows through the same pipeline:
+Every signal flows through a fixed, deterministic pipeline:
 
 1. A typed **Signal** arrives (confidence score, payload, source)
-2. The runtime evaluates the signal against a **DecisionFlow** (YAML-defined graph of conditions)
-3. **Boundary** nodes enforce business rules — blocking, overriding, or escalating the decision
-4. **Human Gate** nodes suspend the decision for manual review when boundaries escalate
-5. Every step is captured in a **DecisionTrace** for audit, explain, and replay
-6. Confirmed decisions produce an **ExecutionRequest** event for downstream orchestration
+2. The runtime evaluates it against a **DecisionFlow** — a YAML-defined graph of conditions
+3. **Boundary** nodes enforce business rules: block, override, escalate, or redirect
+4. **Human Gate** nodes suspend decisions pending manual review when stakes require it
+5. Every step is committed to the **Ledger** — an append-only, hash-chained record
+6. Confirmed decisions publish a typed **ExecutionRequest** event for downstream systems
+
+The same inputs always produce the same decision path. Every decision is traceable, explainable, and replayable.
 
 ---
 
-## Runtime pipeline
+## Architecture
 
 ```
 POST /api/runtime/evaluate
         │
         ▼
-   FlowRegistry  ──────────────────────────────────────────────┐
-        │                                                       │
-        ▼                                                       │
- DecisionRuntimeEngine                                          │
-        │                                                       │
-        ├── ConditionEvaluator  → evaluate DECISION nodes       │
-        │                                                       │
-        ├── BoundaryEngine      → evaluate BOUNDARY nodes       │
-        │        │                                              │
-        │        └── effect: block / override / escalate /      │
-        │                    redirect / allow                   │
-        │                                                       │
-        ├── HumanGateManager    → create pending review         │
-        │        │                 when status = pending_human  │
-        │        └── POST /approve or /reject → confirmed /     │
-        │                                       rejected        │
-        │                                                       │
-        ├── TraceStore          → save DecisionTrace            │
-        │        │                                              │
-        │        └── GET /traces/{trace_id}                     │
-        │            GET /decision/{id}/explain                 │
-        │                                                       │
-        └── EventBus            → publish                       │
-                 │                runtime.execution.requested   │
-                 └── GET /events                                │
-                                                                │
-   DecisionResult ◄──────────────────────────────────────────┘
+   FlowRegistry (YAML definitions)
+        │
+        ▼
+ DecisionRuntimeEngine
+        ├── ConditionEvaluator   evaluate DECISION nodes (AST-safe, no eval())
+        ├── BoundaryEngine       block / override / escalate / redirect / allow
+        ├── HumanGateManager     create pending review when status = pending_human
+        │       └── POST /approve or /reject
+        ├── RuntimeLedgerAdapter commit(trace, result) → Ledger Core v2
+        ├── TraceStore           save DecisionTrace (in-memory cache)
+        └── EventBus             publish EXECUTION_REQUESTED → ExecutionPublisher
+                                         (Redis Streams or in-memory)
+                                                    ↓
+                                         KafkaExecutionPublisher → external orchestrator
 ```
 
 ---
 
-## Features
+## Key features (v1.0)
 
-- **Deterministic evaluation** — identical inputs always produce identical decisions (excluding auto-generated UUIDs)
-- **Declarative flows** — decision logic lives in YAML, not code
-- **Boundary enforcement** — block, override, escalate, or redirect decisions via priority-ordered rules
-- **Human-in-the-loop** — first-class approve/reject lifecycle with audit trail
-- **Explainable decisions** — structured explanation of every evaluation step
-- **Full trace** — every decision is recorded with matched/unmatched conditions and boundary results
-- **Idempotent API** — repeated calls with the same `idempotency_key` return the cached result without duplicate events
-- **Event-driven** — emits typed `RuntimeEvent` objects for downstream integration
+### Core
+
+| Feature | Description |
+|---|---|
+| Deterministic evaluation | Identical inputs always produce identical decision paths |
+| Declarative flows | Decision logic lives in YAML, not code |
+| Boundary enforcement | Block, override, escalate, or redirect — priority-ordered rules |
+| Human-in-the-loop | First-class approve/reject lifecycle with required-role RBAC |
+| Idempotent execution | Repeated calls with the same `idempotency_key` return cached results |
+| Explainable decisions | Every evaluation step is recorded and queryable |
+
+### Integrations
+
+| Backend | Role | Config |
+|---|---|---|
+| PostgreSQL | Append-only ledger (hash-chained) | `LEDGER_BACKEND=postgres` |
+| Redis Streams | Persistent, replayable event bus | `EVENT_BUS_BACKEND=redis` |
+| Kafka | External execution handoff | `EXECUTION_PUBLISHER_BACKEND=kafka` |
+
+### Observability
+
+- Prometheus-compatible `/metrics` endpoint (counters + summaries)
+- Structured JSON access logging (`request_id`, `method`, `path`, `status_code`, `duration_ms`)
+- Split health probes: `/health/live` (liveness) and `/health/ready` (readiness, per-dependency)
+
+### Security
+
+- Security headers on every response (`X-Content-Type-Options`, `X-Frame-Options`, `CSP`, `Cache-Control: no-store`)
+- X-Api-Key auth for human gate actions (role-based, configurable)
+- AST-safe condition evaluation — no `eval()`, no `exec()`
+
+Full feature list and limitations: [docs/features.md](docs/features.md)
 
 ---
 
@@ -120,19 +129,17 @@ docker compose up --build
 Verify the service is running:
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:8002/health/live
 ```
 
 ```json
-{"status": "ok"}
+{"status": "ok", "type": "live"}
 ```
 
----
-
-## Example request
+Evaluate a signal:
 
 ```bash
-curl -X POST http://localhost:8000/api/runtime/evaluate \
+curl -X POST http://localhost:8002/api/runtime/evaluate \
   -H "Content-Type: application/json" \
   -d '{
     "flow_id": "call_center_escalation",
@@ -150,18 +157,12 @@ curl -X POST http://localhost:8000/api/runtime/evaluate \
   }'
 ```
 
----
-
-## Example responses
-
-### Confirmed decision
+The runtime returns a `DecisionResult`:
 
 ```json
 {
   "id": "a1b2c3d4-...",
   "trace_id": "f5e6d7c8-...",
-  "flow_id": "...",
-  "flow_version": "1.0.0",
   "status": "confirmed",
   "outcome": "pass",
   "selected_node_id": "vip_check",
@@ -171,32 +172,20 @@ curl -X POST http://localhost:8000/api/runtime/evaluate \
     "parameters": {"priority": "high", "lane": "vip"}
   },
   "execution_id": "exec_9a8b7c6d-...",
-  "human_gate": null,
-  "confidence": 0.87,
-  "conditions_evaluated": 1,
-  "conditions_passed": 1
+  "confidence": 0.87
 }
 ```
 
-### Pending human review
+When boundary rules escalate the decision:
 
 ```json
 {
   "id": "b2c3d4e5-...",
-  "trace_id": "a1b2c3d4-...",
   "status": "pending_human",
-  "outcome": "pass",
-  "selected_node_id": "vip_check",
-  "action": {
-    "type": "prioritize",
-    "target": "support_queue"
-  },
-  "execution_id": null,
   "human_gate": {
     "id": "gate_7f8e9d0a-...",
     "status": "pending",
-    "title": "Human review required for escalated decision",
-    "question": "Review the escalated decision and choose to approve or reject it",
+    "title": "Human review required",
     "options": [
       {"value": "approve", "label": "Approve", "is_default": true},
       {"value": "reject",  "label": "Reject",  "is_default": false}
@@ -204,6 +193,43 @@ curl -X POST http://localhost:8000/api/runtime/evaluate \
   }
 }
 ```
+
+---
+
+## Production mode
+
+Add to your `.env` (see `.env.example` for the full list):
+
+```env
+# Durable ledger (append-only, hash-chained)
+LEDGER_ENABLED=true
+LEDGER_BACKEND=postgres
+LEDGER_DATABASE_URL=postgresql://user:password@db:5432/decisions
+LEDGER_MODE=strict
+
+# Persistent event stream (Redis 6.2+)
+EVENT_BUS_BACKEND=redis
+REDIS_URL=redis://redis:6379/0
+
+# External execution handoff
+EXECUTION_PUBLISHER_BACKEND=kafka
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+
+# Auth for human gate actions
+AUTH_ENABLED=true
+API_KEY_ROLE_MAP={"your-key": {"actor_id": "alice", "roles": ["reviewer"]}}
+```
+
+Production topology:
+
+```
+Decision Runtime Core
+  ├─ PostgreSQL  (Ledger — append-only facts)
+  ├─ Redis       (EventBus — replayable stream)
+  └─ Kafka       (ExecutionPublisher — downstream handoff)
+```
+
+Full deployment guide: [docs/deployment.md](docs/deployment.md)
 
 ---
 
@@ -218,9 +244,13 @@ curl -X POST http://localhost:8000/api/runtime/evaluate \
 | `GET` | `/api/runtime/decision/{decision_id}/explain` | Explain a decision |
 | `POST` | `/api/runtime/human-gates/{id}/approve` | Approve a pending gate |
 | `POST` | `/api/runtime/human-gates/{id}/reject` | Reject a pending gate |
-| `GET` | `/api/runtime/events` | List all runtime events |
+| `GET` | `/api/runtime/events` | List runtime events (cursor pagination) |
+| `GET` | `/api/runtime/stats` | Aggregated decision outcome statistics |
+| `GET` | `/health/live` | Liveness probe |
+| `GET` | `/health/ready` | Readiness probe (per-dependency checks) |
+| `GET` | `/metrics` | Prometheus metrics (text format 0.0.4) |
 
-Full schema documentation: [docs/api.md](docs/api.md)
+Full API reference: [docs/api.md](docs/api.md)
 
 ---
 
@@ -229,60 +259,79 @@ Full schema documentation: [docs/api.md](docs/api.md)
 ```
 backend/
 ├── app/
-│   ├── config.py                  # Settings (flow_dir, app_name, etc.)
-│   ├── main.py                    # FastAPI app + lifespan (startup singletons)
+│   ├── config.py                      # Settings — env vars + .env
+│   ├── main.py                        # FastAPI app, lifespan, health + metrics routes
+│   ├── auth.py                        # X-Api-Key actor resolution
+│   ├── security_headers.py            # SecurityHeadersMiddleware (ASGI)
 │   ├── integrations/
-│   │   └── event_bus.py           # In-memory publish/subscribe
-│   ├── models/
-│   │   ├── signal.py              # Signal — typed AI output
-│   │   ├── flow.py                # DecisionFlow, DecisionNode, FlowEdge
-│   │   ├── decision.py            # DecisionResult, DecisionStatus
-│   │   ├── boundary.py            # BoundaryResult, BoundaryEffect
-│   │   ├── human_gate.py          # HumanGateRequest, HumanGateStatus
-│   │   ├── trace.py               # DecisionTrace
-│   │   ├── event.py               # RuntimeEvent, EventType
-│   │   └── execution.py           # ExecutionRequest
+│   │   ├── event_bus.py               # In-memory EventBus
+│   │   ├── redis_event_bus.py         # Redis Streams EventBus
+│   │   ├── ledger_client.py           # In-memory Ledger client
+│   │   ├── postgres_ledger_client.py  # PostgreSQL Ledger client
+│   │   ├── runtime_ledger_adapter.py  # DecisionTrace → LedgerEvent
+│   │   ├── ledger_projector.py        # LedgerEvent → DecisionTrace (replay)
+│   │   ├── kafka_execution_publisher.py  # Kafka ExecutionPublisher
+│   │   └── execution_publisher.py     # NoopExecutionPublisher + Protocol
+│   ├── models/                        # Pydantic v2 data models
+│   ├── observability/
+│   │   ├── metrics.py                 # Thread-safe Prometheus registry
+│   │   └── logging_middleware.py      # StructuredLoggingMiddleware (ASGI)
 │   ├── registry/
-│   │   ├── flow_registry.py       # Loads and caches YAML flow files
-│   │   ├── flow_validator.py      # Structural + semantic flow validation
-│   │   └── contract_registry.py   # Inline contract validation
-│   ├── routes/
-│   │   └── runtime.py             # All API route handlers
+│   │   ├── flow_registry.py           # YAML → DecisionFlow loader
+│   │   └── flow_validator.py          # Structural + semantic validation
 │   └── runtime/
-│       ├── engine.py              # DecisionRuntimeEngine — main pipeline
-│       ├── condition_evaluator.py # Safe AST-based condition evaluation
-│       ├── boundary_engine.py     # Boundary node evaluation + effect application
-│       ├── human_gate_manager.py  # Approve/reject lifecycle for escalated decisions
-│       ├── trace_builder.py       # Builds DecisionTrace from evaluation data
-│       ├── trace_store.py         # In-memory trace storage (dual index)
-│       ├── explanation_builder.py # Converts trace to human-readable explanation
-│       └── idempotency_store.py   # Caches results by idempotency key
-├── flows/
-│   ├── call_center_flow.yaml
-│   ├── logistics_flow.yaml
-│   └── manufacturing_quality_flow.yaml
-└── tests/
-    ├── conftest.py
-    ├── flows/                     # Test-specific flow YAML files
-    └── test_*.py                  # Unit + E2E test files
+│       ├── engine.py                  # DecisionRuntimeEngine — main pipeline
+│       ├── condition_evaluator.py     # AST-safe condition evaluation
+│       ├── boundary_engine.py         # Boundary node evaluation
+│       ├── human_gate_manager.py      # Approve/reject lifecycle
+│       ├── trace_store.py             # In-memory trace storage
+│       ├── trace_builder.py           # DecisionTrace construction
+│       ├── explanation_builder.py     # Human-readable explanations
+│       └── idempotency_store.py       # Result cache by idempotency key
+├── flows/                             # Production YAML flow definitions
+└── tests/                             # 303 unit + integration tests
 ```
 
 ---
 
 ## Status
 
-```
-MVP complete — in-memory runtime, fully tested (82 tests passing)
+**v1.0.0-rc1** — Production-ready single-node Decision OS Kernel.
 
-Next:
-  - Redis-backed EventBus (persistent pub/sub)
-  - Kafka integration for execution event delivery
-  - Ledger integration for immutable decision log
-  - External execution engine (orchestrator integration)
-  - Authentication and role-based gate assignment
-  - Metrics and observability (Prometheus / OpenTelemetry)
-```
+303 tests passing. Core evaluation pipeline, all integrations, observability, security headers, and health probes are complete.
 
-## License
+| Layer | Status |
+|---|---|
+| Decision evaluation engine | Production-ready |
+| Boundary enforcement | Production-ready |
+| Human gate (approve/reject, RBAC) | Production-ready |
+| Ledger (memory + PostgreSQL) | Production-ready |
+| EventBus (memory + Redis Streams) | Production-ready |
+| ExecutionPublisher (noop + Kafka) | Production-ready |
+| Observability (metrics + logging) | Production-ready |
+| Security headers + health probes | Production-ready |
 
-MIT License © 2026 Masao Watanabe
+### Limitations
+
+- **Single-node only** — no distributed consensus, no leader election
+- **No multi-region** — TraceStore and HumanGateManager are in-process
+- **No flow hot-reload** — flows are loaded once at startup
+- **No rate limiting** — add a reverse proxy (nginx, Envoy) in front for RPS caps
+- **PostgreSQL only** for ledger persistence (no MySQL, no MongoDB)
+- **Redis 6.2+** required for exclusive-range XRANGE pagination
+
+See [docs/features.md](docs/features.md) for the full capability and limitation list.
+
+---
+
+## Design principles
+
+> AI generates signals.
+> Runtime evaluates decisions.
+> Boundary controls risk.
+> Human approves exceptions.
+> Ledger commits facts.
+> EventBus announces.
+> ExecutionPublisher hands off.
+>
+> This is a Decision OS Kernel.
