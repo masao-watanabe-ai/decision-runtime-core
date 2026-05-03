@@ -1,0 +1,35 @@
+flow_id: always_confirmed
+name: Always Confirmed Flow
+version: 1.0.0
+description: Test flow — single decision node with no condition (always matches), no boundary nodes
+entry_node_id: match_node
+is_active: true
+
+nodes:
+  - id: match_node
+    name: Match Node
+    node_type: decision
+    condition: null
+    priority: 10
+    action:
+      type: route
+      target: test_queue
+      parameters:
+        priority: high
+    config:
+      contract_type: test
+      contract_version: 1.0.0
+
+  - id: fallback_node
+    name: Fallback Node
+    node_type: fallback
+    action:
+      type: route
+      target: fallback_queue
+      parameters:
+        priority: normal
+    config:
+      contract_type: test
+      contract_version: 1.0.0
+
+edges: []

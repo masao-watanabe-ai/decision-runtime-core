@@ -1,0 +1,134 @@
+flow_id: logistics_shipment_routing
+name: Logistics Shipment Routing Flow
+version: 1.0.0
+description: Determines shipment routing priority, validates warehouse capacity constraints, and escalates high-value shipments to a routing specialist for approval
+entry_node_id: shipment_priority_check
+is_active: true
+metadata:
+  resolution_policy:
+    strategy: priority
+    priority_field: shipment_value
+    tiebreaker: earliest_deadline
+  execution_policy:
+    mode: sequential
+    retry: true
+    max_retries: 2
+    timeout_seconds: 180
+  error_policy:
+    on_error: fallback
+    fallback_node_id: standard_routing_fallback
+    max_retries: 2
+    alert_on_failure: true
+
+nodes:
+  - id: shipment_priority_check
+    name: Shipment Priority Decision
+    node_type: decision
+    condition: "payload.shipment_value > 10000 and payload.delivery_deadline_hours < 24"
+    priority: 25
+    action:
+      type: route_express
+      target: express_dispatch
+      parameters:
+        carrier: overnight
+        priority: urgent
+    description: Determines if this shipment qualifies for express routing based on value and deadline
+    config:
+      contract_type: shipment_priority_classification
+      contract_version: 1.0.0
+      required_signals:
+        - shipment_value
+        - delivery_deadline_hours
+        - shipment_weight_kg
+
+  - id: standard_priority_check
+    name: Standard Priority Decision
+    node_type: decision
+    condition: "payload.shipment_value > 1000 and payload.delivery_deadline_hours < 72"
+    priority: 10
+    action:
+      type: route_standard
+      target: standard_dispatch
+      parameters:
+        carrier: ground_express
+        priority: normal
+    description: Routes mid-tier shipments through standard express
+    config:
+      contract_type: standard_priority_classification
+      contract_version: 1.0.0
+
+  - id: warehouse_capacity_boundary
+    name: Warehouse Capacity Boundary
+    node_type: boundary
+    condition: "payload.destination_capacity_pct >= 85"
+    severity: high
+    effect: block
+    description: Validates that the target warehouse has sufficient capacity to accept this shipment
+    config:
+      contract_type: warehouse_capacity_check
+      contract_version: 1.0.0
+      boundary_type: resource_quota
+      capacity_threshold_pct: 85.0
+      check_target: destination_warehouse
+
+  - id: routing_specialist_gate
+    name: Routing Specialist Approval Gate
+    node_type: human_gate
+    description: High-value shipments require manual routing approval from a logistics specialist
+    config:
+      timeout_seconds: 3600
+      assignee_role: logistics_specialist
+      title: High-Value Shipment Requires Routing Approval
+      question: Review this shipment and confirm the recommended express routing path
+
+  - id: dispatch_complete
+    name: Dispatch Complete
+    node_type: end
+
+  - id: standard_routing_fallback
+    name: Standard Routing Fallback
+    node_type: fallback
+    action:
+      type: route_ground
+      target: ground_dispatch
+      parameters:
+        carrier: ground_standard
+        priority: low
+    description: Applies standard ground shipping routing for shipments that do not qualify for express
+    config:
+      contract_type: standard_ground_routing
+      contract_version: 1.0.0
+
+edges:
+  - id: priority_to_capacity
+    source_node_id: shipment_priority_check
+    target_node_id: warehouse_capacity_boundary
+    condition_expression: "outcome == 'pass'"
+    label: Qualifies for Express
+    priority: 0
+
+  - id: standard_to_capacity
+    source_node_id: standard_priority_check
+    target_node_id: warehouse_capacity_boundary
+    condition_expression: "outcome == 'pass'"
+    label: Standard Express Route
+    priority: 0
+
+  - id: priority_to_fallback
+    source_node_id: shipment_priority_check
+    target_node_id: standard_routing_fallback
+    condition_expression: "outcome == 'fail'"
+    label: Standard Routing
+    priority: 1
+
+  - id: capacity_to_specialist
+    source_node_id: warehouse_capacity_boundary
+    target_node_id: routing_specialist_gate
+    label: Capacity Available
+    priority: 0
+
+  - id: specialist_to_dispatch
+    source_node_id: routing_specialist_gate
+    target_node_id: dispatch_complete
+    label: Approved for Express Dispatch
+    priority: 0

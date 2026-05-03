@@ -1,0 +1,49 @@
+flow_id: escalate_flow
+name: Escalate Flow
+version: 1.0.0
+description: Test flow — decision always matches; boundary escalates when payload.should_escalate is true
+entry_node_id: match_node
+is_active: true
+
+nodes:
+  - id: match_node
+    name: Match Node
+    node_type: decision
+    condition: null
+    priority: 10
+    action:
+      type: route
+      target: review_queue
+      parameters:
+        priority: high
+    config:
+      contract_type: test
+      contract_version: 1.0.0
+
+  - id: escalate_boundary
+    name: Escalate Boundary
+    node_type: boundary
+    condition: "payload.should_escalate == true"
+    severity: high
+    effect: escalate
+    config:
+      contract_type: test
+      contract_version: 1.0.0
+
+  - id: fallback_node
+    name: Fallback Node
+    node_type: fallback
+    action:
+      type: route
+      target: fallback_queue
+      parameters:
+        priority: normal
+    config:
+      contract_type: test
+      contract_version: 1.0.0
+
+edges:
+  - id: match_to_boundary
+    source_node_id: match_node
+    target_node_id: escalate_boundary
+    priority: 0

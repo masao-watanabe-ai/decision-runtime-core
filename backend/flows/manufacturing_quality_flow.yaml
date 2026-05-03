@@ -1,0 +1,129 @@
+flow_id: manufacturing_quality_control
+name: Manufacturing Quality Control Flow
+version: 1.0.0
+description: Evaluates product quality at inspection checkpoints, enforces production rate boundaries, and escalates borderline defects to a quality supervisor
+entry_node_id: inspection_check
+is_active: true
+metadata:
+  resolution_policy:
+    strategy: priority
+    pass_threshold: 0.95
+    fail_threshold: 0.70
+  execution_policy:
+    mode: sequential
+    retry: false
+    timeout_seconds: 120
+  error_policy:
+    on_error: fallback
+    fallback_node_id: defect_fallback
+    max_retries: 1
+    alert_on_failure: true
+
+nodes:
+  - id: inspection_check
+    name: Product Inspection Decision
+    node_type: decision
+    condition: "confidence >= 0.95 and payload.defect_rate < 0.02"
+    priority: 30
+    action:
+      type: approve_batch
+      target: production_line
+      parameters:
+        disposition: pass
+    description: Evaluates sensor data to determine if the product passes quality thresholds
+    config:
+      contract_type: quality_inspection
+      contract_version: 1.0.0
+      required_signals:
+        - defect_rate
+        - dimensional_variance
+        - surface_quality_score
+
+  - id: borderline_check
+    name: Borderline Quality Decision
+    node_type: decision
+    condition: "confidence >= 0.70 and payload.defect_rate < 0.05"
+    priority: 15
+    action:
+      type: escalate_batch
+      target: supervisor_queue
+      parameters:
+        disposition: review_required
+    description: Catches borderline cases for supervisor review
+    config:
+      contract_type: borderline_inspection
+      contract_version: 1.0.0
+
+  - id: production_rate_boundary
+    name: Production Rate Boundary
+    node_type: boundary
+    condition: "payload.defect_rate_pct >= 5"
+    severity: medium
+    effect: escalate
+    description: Ensures defect-flagged units do not exceed 5% of the hourly production volume
+    config:
+      contract_type: defect_rate_boundary
+      contract_version: 1.0.0
+      boundary_type: value_range
+      max_defect_rate_pct: 5.0
+      window_seconds: 3600
+
+  - id: quality_supervisor_gate
+    name: Quality Supervisor Review Gate
+    node_type: human_gate
+    description: Escalates borderline inspection results to the quality supervisor for manual review
+    config:
+      timeout_seconds: 900
+      assignee_role: quality_supervisor
+      title: Borderline Product Quality Requires Manual Review
+      question: Review the attached inspection report and decide whether to approve or reject this batch
+
+  - id: inspection_complete
+    name: Inspection Complete
+    node_type: end
+
+  - id: defect_fallback
+    name: Defect Routing Fallback
+    node_type: fallback
+    action:
+      type: quarantine_batch
+      target: rework_zone
+      parameters:
+        disposition: failed
+    description: Routes confirmed defective products to the quarantine zone for rework
+    config:
+      contract_type: defect_quarantine_routing
+      contract_version: 1.0.0
+
+edges:
+  - id: inspection_to_boundary
+    source_node_id: inspection_check
+    target_node_id: production_rate_boundary
+    condition_expression: "outcome == 'pass'"
+    label: Passed Inspection
+    priority: 0
+
+  - id: inspection_to_fallback
+    source_node_id: inspection_check
+    target_node_id: defect_fallback
+    condition_expression: "outcome == 'fail'"
+    label: Failed Inspection — Quarantine
+    priority: 1
+
+  - id: borderline_to_supervisor
+    source_node_id: borderline_check
+    target_node_id: quality_supervisor_gate
+    label: Borderline Case
+    priority: 0
+
+  - id: boundary_to_supervisor
+    source_node_id: production_rate_boundary
+    target_node_id: quality_supervisor_gate
+    label: Within Defect Rate Limit
+    priority: 0
+
+  - id: supervisor_to_complete
+    source_node_id: quality_supervisor_gate
+    target_node_id: inspection_complete
+    label: Supervisor Approved Batch
+    priority: 0

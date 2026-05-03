@@ -1,0 +1,109 @@
+flow_id: call_center_escalation
+name: Call Center Escalation Flow
+version: 1.0.0
+description: Routes incoming call center requests by customer tier, enforces rate limits, and requires supervisor approval for VIP escalations
+entry_node_id: vip_check
+is_active: true
+metadata:
+  resolution_policy:
+    strategy: priority
+    priority_field: customer_tier
+    tiebreaker: fifo
+  execution_policy:
+    mode: sequential
+    retry: true
+    max_retries: 3
+    timeout_seconds: 300
+  error_policy:
+    on_error: fallback
+    fallback_node_id: default_fallback
+    max_retries: 3
+    alert_on_failure: true
+
+nodes:
+  - id: vip_check
+    name: VIP Customer Check
+    node_type: decision
+    condition: 'payload.customer_tier == "vip"'
+    priority: 20
+    action:
+      type: prioritize
+      target: support_queue
+      parameters:
+        priority: high
+        lane: vip
+    description: Determines if the incoming customer is VIP tier
+    config:
+      contract_type: customer_tier_check
+      contract_version: 1.0.0
+      required_signals:
+        - customer_tier
+        - account_id
+
+  - id: rate_limit_boundary
+    name: Escalation Rate Limit Boundary
+    node_type: boundary
+    condition: "payload.escalation_count >= 100"
+    severity: high
+    effect: block
+    description: Enforces a maximum of 100 escalations per hour to prevent queue overflow
+    config:
+      contract_type: escalation_rate_limit
+      contract_version: 1.0.0
+      boundary_type: rate_limit
+      limit: 100
+      window_seconds: 3600
+
+  - id: supervisor_gate
+    name: Supervisor Approval Gate
+    node_type: human_gate
+    description: Requires a supervisor to approve VIP escalation before routing
+    config:
+      timeout_seconds: 1800
+      assignee_role: supervisor
+      title: VIP Escalation Requires Supervisor Approval
+      question: Please review and approve or reject this VIP escalation request
+
+  - id: route_complete
+    name: Routing Complete
+    node_type: end
+
+  - id: default_fallback
+    name: Default Fallback Handler
+    node_type: fallback
+    action:
+      type: route
+      target: support_queue
+      parameters:
+        priority: normal
+    description: Handles unmatched cases by applying standard queue routing
+    config:
+      contract_type: default_queue_routing
+      contract_version: 1.0.0
+
+edges:
+  - id: vip_to_boundary
+    source_node_id: vip_check
+    target_node_id: rate_limit_boundary
+    condition_expression: "outcome == 'pass'"
+    label: VIP Confirmed
+    priority: 0
+
+  - id: vip_to_fallback
+    source_node_id: vip_check
+    target_node_id: default_fallback
+    condition_expression: "outcome == 'fail'"
+    label: Standard Customer — Route to Default
+    priority: 1
+
+  - id: boundary_to_gate
+    source_node_id: rate_limit_boundary
+    target_node_id: supervisor_gate
+    label: Within Rate Limit
+    priority: 0
+
+  - id: gate_to_complete
+    source_node_id: supervisor_gate
+    target_node_id: route_complete
+    label: Supervisor Approved
+    priority: 0
