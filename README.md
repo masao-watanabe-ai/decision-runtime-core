@@ -28,6 +28,27 @@ Full architecture: [docs/architecture-runtime.md](docs/architecture-runtime.md)
 
 ---
 
+## Use cases
+
+- Call center routing and escalation
+- Fraud detection with human approval
+- Logistics exception handling
+- Financial transaction approval flows
+- Manufacturing quality decision systems
+
+---
+
+## What this is NOT
+
+- Not a workflow engine (like Temporal, Airflow)
+- Not just a rule engine
+- Not an LLM application framework
+- Not a chat system
+
+👉 This is a **decision execution layer**
+
+---
+
 ## The problem
 
 AI systems produce predictions. Production systems need decisions.
