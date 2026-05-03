@@ -254,6 +254,176 @@ Full deployment guide: [docs/deployment.md](docs/deployment.md)
 
 ---
 
+## View Core integration
+
+DTM View Core does not make decisions.
+It calls Decision Runtime Core to evaluate, inspect, compare, and simulate decision traces.
+
+Decision ownership remains inside Runtime:
+
+```
+Interaction → Signal → Runtime → Boundary → Human → Ledger → View
+```
+
+**Runtime makes decisions. Ledger records them. View makes them understandable.**
+
+Three View-support APIs are exposed:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/runtime/traces` | List trace summaries (status, outcome, action.type, confidence) |
+| `POST` | `/api/runtime/compare` | Field-level diff between two traces |
+| `POST` | `/api/runtime/simulate` | Re-evaluate with signal overrides — no side effects |
+
+### `GET /api/runtime/traces`
+
+Returns lightweight `TraceSummary` objects sorted newest-first.  Supports
+`limit` (max 1 000) and `offset` for pagination.
+
+```bash
+curl "http://localhost:8002/api/runtime/traces?limit=20&offset=0"
+```
+
+Each summary includes `trace_id`, `decision_id`, `flow_id`, `status`,
+`outcome`, `action_type`, `confidence`, `created_at`, and `committed_at`.
+
+### `POST /api/runtime/compare`
+
+Returns field-level diffs between two traces.
+
+```bash
+curl -X POST http://localhost:8002/api/runtime/compare \
+  -H "Content-Type: application/json" \
+  -d '{"base_trace_id": "...", "target_trace_id": "..."}'
+```
+
+```json
+{
+  "base_trace_id": "...",
+  "target_trace_id": "...",
+  "diffs": [
+    {"path": "decision.status",     "base": "confirmed",    "target": "pending_human"},
+    {"path": "decision.confidence", "base": 0.9,            "target": 0.6}
+  ]
+}
+```
+
+### `POST /api/runtime/simulate`
+
+Re-evaluates the original signal from a trace with optional overrides.
+**Never commits to Ledger, never publishes to EventBus, never creates a
+persistent HumanGate.**
+
+```bash
+curl -X POST http://localhost:8002/api/runtime/simulate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "trace_id": "...",
+    "signal_overrides": {
+      "confidence": 0.4,
+      "payload": {"refund_amount": 120000}
+    }
+  }'
+```
+
+```json
+{
+  "mode": "simulation",
+  "source_trace_id": "...",
+  "result": { "status": "pending_human", ... },
+  "trace": { ... },
+  "committed": false,
+  "events_published": false
+}
+```
+
+---
+
+## Interaction Core Flow
+
+Decision Runtime Core can evaluate structured Signals from Interaction Core.
+
+Interaction Core captures messages, evidence, and analysis results.
+It sends them as Signals to Runtime — it does not make decisions.
+
+```
+POST /api/runtime/evaluate
+{
+  "flow_id": "interaction_default_flow",
+  "signal": {
+    "type": "interaction_analysis",
+    "confidence": 0.87,
+    "payload": {
+      "channel_id": "ch_001",
+      "message_id": "msg_001",
+      "summary": "Customer requests refund and mentions legal risk.",
+      "keywords": ["refund", "legal"],
+      "insights": ["Possible escalation case"],
+      "suggested_actions": ["Escalate to support manager"]
+    },
+    "source": "interaction-core",
+    "idempotency_key": "interaction:ch_001:msg_001:v1"
+  }
+}
+```
+
+Runtime evaluates those Signals through `interaction_default_flow`:
+
+```
+Interaction Core
+  → Structured Signal (Message / Evidence / Analysis)
+  → Decision Runtime Core
+      ├── [A] High-risk keywords + confidence >= 0.7
+      │       → Boundary (escalate) → Human Gate → Ledger
+      ├── [B] Suggested actions + confidence >= 0.8
+      │       → Decision Candidate → Decision Trace Studio → Ledger
+      ├── [C] Insights / keywords + 0.5 <= confidence < 0.8
+      │       → Route to Studio → Ledger
+      ├── [D] confidence < 0.5
+      │       → Notify only → Channel → Ledger
+      └── [E] No actionable content
+              → Fallback log → Ledger
+```
+
+**Important:**
+
+- Interaction Core does not make decisions. Runtime remains the only Decision execution point.
+- Suggested actions from AI analysis are treated as Decision Candidates, not committed execution decisions.
+- High-risk interaction signals (legal, contract, security, incident, refund, compliance keywords at confidence >= 0.7) are always routed to Human Gate before any action.
+- Every evaluation is committed to the Ledger and surfaced in View / Studio.
+
+**High-risk example response:**
+
+```json
+{
+  "status": "pending_human",
+  "action": {
+    "type": "escalate",
+    "target": "human_review",
+    "parameters": { "reason": "high_risk_interaction_signal" }
+  },
+  "human_gate": {
+    "status": "pending",
+    "title": "High-Risk Interaction Signal Requires Human Review"
+  }
+}
+```
+
+**Decision Candidate example response:**
+
+```json
+{
+  "status": "confirmed",
+  "action": {
+    "type": "create_decision_candidate",
+    "target": "decision_trace_studio",
+    "parameters": { "reason": "high_confidence_suggested_action" }
+  }
+}
+```
+
+---
+
 ## API endpoints
 
 | Method | Path | Description |
@@ -261,8 +431,11 @@ Full deployment guide: [docs/deployment.md](docs/deployment.md)
 | `POST` | `/api/runtime/evaluate` | Evaluate a signal against a flow |
 | `GET` | `/api/runtime/flows` | List all loaded flows |
 | `GET` | `/api/runtime/flows/{flow_id}` | Get a flow by ID |
+| `GET` | `/api/runtime/traces` | List trace summaries (View Core) |
 | `GET` | `/api/runtime/traces/{trace_id}` | Get a decision trace |
 | `GET` | `/api/runtime/decision/{decision_id}/explain` | Explain a decision |
+| `POST` | `/api/runtime/compare` | Field-level diff between two traces (View Core) |
+| `POST` | `/api/runtime/simulate` | Simulate with signal overrides (View Core) |
 | `POST` | `/api/runtime/human-gates/{id}/approve` | Approve a pending gate |
 | `POST` | `/api/runtime/human-gates/{id}/reject` | Reject a pending gate |
 | `GET` | `/api/runtime/events` | List runtime events (cursor pagination) |

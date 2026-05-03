@@ -103,11 +103,11 @@ edges:
     label: Passed Inspection
     priority: 0
 
-  - id: inspection_to_fallback
+  - id: inspection_to_borderline
     source_node_id: inspection_check
-    target_node_id: defect_fallback
+    target_node_id: borderline_check
     condition_expression: "outcome == 'fail'"
-    label: Failed Inspection — Quarantine
+    label: Not Full Pass — Try Borderline Review
     priority: 1
 
   - id: borderline_to_supervisor
@@ -115,6 +115,13 @@ edges:
     target_node_id: quality_supervisor_gate
     label: Borderline Case
     priority: 0
+
+  - id: borderline_to_fallback
+    source_node_id: borderline_check
+    target_node_id: defect_fallback
+    condition_expression: "outcome == 'fail'"
+    label: Below Borderline — Quarantine
+    priority: 1
 
   - id: boundary_to_supervisor
     source_node_id: production_rate_boundary

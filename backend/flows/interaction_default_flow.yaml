@@ -1,0 +1,239 @@
+flow_id: interaction_default_flow
+name: Interaction Core Signal Flow
+version: 1.0.0
+description: >
+  Evaluates structured Signals from Interaction Core.
+  Transforms Message, Evidence, and Analysis signals into governed Decisions.
+  Interaction Core does not make Decisions — Runtime Core is the sole Decision execution point.
+  Suggested actions from AI analysis are treated as Decision Candidates, not committed executions.
+entry_node_id: high_risk_escalation
+is_active: true
+metadata:
+  resolution_policy:
+    strategy: priority
+    tiebreaker: fifo
+  execution_policy:
+    mode: sequential
+    retry: false
+    timeout_seconds: 60
+  error_policy:
+    on_error: fallback
+    fallback_node_id: fallback_log_only
+
+nodes:
+  # ── A. High-risk keywords + confidence >= 0.7 → escalate to Human Gate ──
+  - id: high_risk_escalation
+    name: High Risk Escalation Decision
+    node_type: decision
+    condition: >-
+      ("legal" in payload.keywords or "contract" in payload.keywords or
+      "security" in payload.keywords or "incident" in payload.keywords or
+      "refund" in payload.keywords or "compliance" in payload.keywords)
+      and confidence >= 0.7
+    priority: 40
+    action:
+      type: escalate
+      target: human_review
+      parameters:
+        reason: high_risk_interaction_signal
+    description: >
+      Escalates high-risk interaction signals that contain legal, contract, security,
+      incident, refund, or compliance keywords with confidence >= 0.7.
+      Always routes to Human Gate — never auto-executes.
+    config:
+      contract_type: interaction_high_risk
+      contract_version: 1.0.0
+      required_signals:
+        - confidence
+        - keywords
+
+  # ── B. Suggested actions present + confidence >= 0.8 → Decision Candidate ──
+  - id: high_confidence_action
+    name: High Confidence Suggested Action Decision
+    node_type: decision
+    condition: 'payload.suggested_actions and confidence >= 0.8'
+    priority: 30
+    action:
+      type: create_decision_candidate
+      target: decision_trace_studio
+      parameters:
+        reason: high_confidence_suggested_action
+    description: >
+      Creates a Decision Candidate when suggested actions exist and confidence is high.
+      Candidate only — not a committed execution decision.
+      Interaction Core does not make decisions; Runtime Core evaluates candidacy.
+    config:
+      contract_type: interaction_decision_candidate
+      contract_version: 1.0.0
+      required_signals:
+        - confidence
+        - suggested_actions
+
+  # ── C. Insights or keywords present + medium confidence → route to Studio ──
+  - id: needs_structuring
+    name: Needs Structuring Decision
+    node_type: decision
+    condition: >-
+      (payload.insights or payload.keywords or payload.suggested_actions)
+      and confidence >= 0.5 and confidence < 0.8
+    priority: 20
+    action:
+      type: route_to_studio
+      target: decision_trace_studio
+      parameters:
+        reason: needs_structuring
+    description: >
+      Routes signals with insights, keywords, or suggested actions at medium confidence
+      to Decision Trace Studio for human-assisted structuring.
+    config:
+      contract_type: interaction_studio_routing
+      contract_version: 1.0.0
+      required_signals:
+        - confidence
+
+  # ── D. Low confidence → notify only ──
+  - id: low_confidence
+    name: Low Confidence Notify Only Decision
+    node_type: decision
+    condition: 'confidence < 0.5'
+    priority: 10
+    action:
+      type: notify_only
+      target: channel
+      parameters:
+        reason: low_confidence_signal
+    description: >
+      Sends a notification-only signal when confidence is below threshold.
+      No action taken — logged and surfaced to the originating channel only.
+    config:
+      contract_type: interaction_notify_only
+      contract_version: 1.0.0
+      required_signals:
+        - confidence
+
+  # ── Boundary: high-risk signals always require Human Gate (defence in depth) ──
+  - id: high_risk_escalation_boundary
+    name: High Risk Escalation Boundary
+    node_type: boundary
+    condition: >-
+      ("legal" in payload.keywords or "contract" in payload.keywords or
+      "security" in payload.keywords or "incident" in payload.keywords or
+      "refund" in payload.keywords or "compliance" in payload.keywords)
+      and confidence >= 0.7
+    severity: high
+    effect: escalate
+    description: >
+      Governance boundary: ensures high-risk interaction signals always route to
+      Human Gate before any action is taken, regardless of which decision node matched.
+    config:
+      contract_type: high_risk_escalation_gate
+      contract_version: 1.0.0
+      boundary_type: escalation_guard
+
+  # ── Human Gate: review required for high-risk signals ──
+  - id: interaction_review_gate
+    name: Interaction Human Review Gate
+    node_type: human_gate
+    description: >
+      Requires human review and approval before any action on high-risk interaction signals.
+      Assignee must hold the human_review role.
+    config:
+      timeout_seconds: 3600
+      assignee_role: human_review
+      title: High-Risk Interaction Signal Requires Human Review
+      question: >
+        A high-risk signal from Interaction Core has been flagged.
+        Please review the interaction analysis and approve or reject the proposed escalation.
+
+  - id: interaction_complete
+    name: Interaction Evaluation Complete
+    node_type: end
+
+  # ── E. Fallback: no actionable signal → log to ledger ──
+  - id: fallback_log_only
+    name: Fallback Log Only Handler
+    node_type: fallback
+    action:
+      type: log_only
+      target: ledger
+      parameters:
+        reason: no_actionable_signal
+    description: >
+      Logs signals with no actionable outcome to the ledger for audit purposes.
+      Used when no decision node matched and confidence is not low enough for notify_only.
+    config:
+      contract_type: interaction_fallback_logging
+      contract_version: 1.0.0
+
+edges:
+  # ── High-risk path: A → Boundary → Gate → Complete ──
+  - id: high_risk_to_boundary
+    source_node_id: high_risk_escalation
+    target_node_id: high_risk_escalation_boundary
+    condition_expression: "outcome == 'pass'"
+    label: High Risk Signal Detected
+    priority: 0
+
+  - id: boundary_to_gate
+    source_node_id: high_risk_escalation_boundary
+    target_node_id: interaction_review_gate
+    label: Escalation Triggered — Route to Human Gate
+    priority: 0
+
+  - id: gate_to_complete
+    source_node_id: interaction_review_gate
+    target_node_id: interaction_complete
+    label: Human Review Complete
+    priority: 0
+
+  # ── Chained evaluation: A → B → C → D for validator reachability ──
+  # (The engine evaluates all decision nodes in parallel; edges here express
+  #  the fallback order for visualization and validator compliance.)
+  - id: high_risk_to_high_confidence
+    source_node_id: high_risk_escalation
+    target_node_id: high_confidence_action
+    condition_expression: "outcome == 'fail'"
+    label: No High-Risk Match — Try High Confidence
+    priority: 1
+
+  - id: high_confidence_to_complete
+    source_node_id: high_confidence_action
+    target_node_id: interaction_complete
+    condition_expression: "outcome == 'pass'"
+    label: Decision Candidate Created
+    priority: 0
+
+  - id: high_confidence_to_needs_structuring
+    source_node_id: high_confidence_action
+    target_node_id: needs_structuring
+    condition_expression: "outcome == 'fail'"
+    label: No High-Confidence Action — Try Structuring
+    priority: 1
+
+  - id: needs_structuring_to_complete
+    source_node_id: needs_structuring
+    target_node_id: interaction_complete
+    condition_expression: "outcome == 'pass'"
+    label: Routed to Studio
+    priority: 0
+
+  - id: needs_structuring_to_low_confidence
+    source_node_id: needs_structuring
+    target_node_id: low_confidence
+    condition_expression: "outcome == 'fail'"
+    label: Not Structurable — Try Low Confidence
+    priority: 1
+
+  - id: low_confidence_to_complete
+    source_node_id: low_confidence
+    target_node_id: interaction_complete
+    condition_expression: "outcome == 'pass'"
+    label: Notification Sent
+    priority: 0
+
+  - id: low_confidence_to_fallback
+    source_node_id: low_confidence
+    target_node_id: fallback_log_only
+    condition_expression: "outcome == 'fail'"
+    label: No Match — Fallback to Log
+    priority: 1

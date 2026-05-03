@@ -46,6 +46,8 @@ _ALLOWED_AST_TYPES: frozenset[type] = frozenset(
         ast.LtE,
         ast.Gt,
         ast.GtE,
+        ast.In,
+        ast.NotIn,
         ast.Name,
         ast.Constant,
         ast.Attribute,
@@ -221,6 +223,10 @@ class _SafeEvaluator:
                 return left > right  # type: ignore[operator]
             if isinstance(op, ast.GtE):
                 return left >= right  # type: ignore[operator]
+            if isinstance(op, ast.In):
+                return left in right  # type: ignore[operator]
+            if isinstance(op, ast.NotIn):
+                return left not in right  # type: ignore[operator]
         except TypeError:
             # Incompatible types (e.g. str < int) are not an evaluator error;
             # the comparison simply fails.

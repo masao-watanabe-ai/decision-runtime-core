@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -74,6 +74,73 @@ class GateActionBody(BaseModel):
 
     actor_id: Optional[str] = Field(None, description="Reviewer identifier; required when auth_enabled=False")
     comment: Optional[str] = Field(None, max_length=4096, description="Optional reviewer note")
+
+
+# ------------------------------------------------------------------ #
+# View Core integration models                                         #
+# ------------------------------------------------------------------ #
+
+
+class TraceSummary(BaseModel):
+    """Lightweight trace record for listing and inspection by View Core."""
+
+    trace_id: str
+    decision_id: Optional[str] = None
+    flow_id: str
+    status: Optional[str] = None
+    outcome: Optional[str] = None
+    action_type: Optional[str] = None
+    confidence: Optional[float] = None
+    created_at: datetime
+    committed_at: Optional[datetime] = None
+
+
+class CompareRequest(BaseModel):
+    """Request body for POST /api/runtime/compare."""
+
+    base_trace_id: str
+    target_trace_id: str
+
+
+class TraceDiff(BaseModel):
+    """A single field-level difference between two traces."""
+
+    path: str
+    base: Any
+    target: Any
+
+
+class CompareResponse(BaseModel):
+    """Response from POST /api/runtime/compare."""
+
+    base_trace_id: str
+    target_trace_id: str
+    diffs: list[TraceDiff]
+
+
+class SignalOverrides(BaseModel):
+    """Caller-supplied overrides applied to the original signal in a simulation."""
+
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    payload: Optional[dict[str, Any]] = None
+
+
+class SimulateRequest(BaseModel):
+    """Request body for POST /api/runtime/simulate."""
+
+    trace_id: str
+    signal_overrides: Optional[SignalOverrides] = None
+
+
+class SimulateResponse(BaseModel):
+    """Response from POST /api/runtime/simulate — never committed or published."""
+
+    mode: str = "simulation"
+    source_trace_id: str
+    result: DecisionResult
+    trace: DecisionTrace
+    committed: bool = False
+    events_published: bool = False
 
 
 # ------------------------------------------------------------------ #
@@ -482,3 +549,235 @@ async def reject_gate(
     _metrics.increment("human_gate_action_total", {"action": "reject"})
     _append_human_gate_to_ledger(request, result, request_id, actor_id, actor_roles_, "reject", body.comment)
     return result
+
+
+# ------------------------------------------------------------------ #
+# View Core integration — traces list, compare, simulate               #
+# ------------------------------------------------------------------ #
+
+
+def _compute_trace_diffs(base: DecisionTrace, target: DecisionTrace) -> list[TraceDiff]:
+    """Return field-level diffs between two DecisionTrace objects."""
+    diffs: list[TraceDiff] = []
+    base_r = base.decision_results[0] if base.decision_results else None
+    target_r = target.decision_results[0] if target.decision_results else None
+
+    def _diff(path: str, b: Any, t: Any) -> None:
+        if b != t:
+            diffs.append(TraceDiff(path=path, base=b, target=t))
+
+    _diff("decision.status",
+          base_r.status.value if base_r else None,
+          target_r.status.value if target_r else None)
+    _diff("decision.outcome",
+          base_r.outcome.value if base_r else None,
+          target_r.outcome.value if target_r else None)
+    _diff("decision.selected_node_id",
+          base_r.selected_node_id if base_r else None,
+          target_r.selected_node_id if target_r else None)
+    _diff("decision.confidence",
+          base_r.confidence if base_r else None,
+          target_r.confidence if target_r else None)
+
+    base_action = base_r.action if base_r else None
+    target_action = target_r.action if target_r else None
+    if base_action != target_action:
+        if base_action is None or target_action is None:
+            diffs.append(TraceDiff(path="decision.action", base=base_action, target=target_action))
+        else:
+            all_keys = sorted(set(list(base_action.keys()) + list(target_action.keys())))
+            for key in all_keys:
+                _diff(f"decision.action.{key}", base_action.get(key), target_action.get(key))
+
+    base_br = base_r.boundary_results if base_r else []
+    target_br = target_r.boundary_results if target_r else []
+    _diff("boundary.count", len(base_br), len(target_br))
+    base_triggered = sorted([br.boundary_id for br in base_br if br.triggered])
+    target_triggered = sorted([br.boundary_id for br in target_br if br.triggered])
+    _diff("boundary.triggered_ids", base_triggered, target_triggered)
+
+    base_gate = base_r.human_gate if base_r else None
+    target_gate = target_r.human_gate if target_r else None
+    _diff("human_gate.present", base_gate is not None, target_gate is not None)
+    if base_gate and target_gate:
+        _diff("human_gate.status", base_gate.status.value, target_gate.status.value)
+
+    _diff("trace.state", base.state.value, target.state.value)
+
+    base_node_map = {n["node_id"]: n for n in base.evaluated_nodes}
+    target_node_map = {n["node_id"]: n for n in target.evaluated_nodes}
+    all_node_ids = sorted(set(list(base_node_map.keys()) + list(target_node_map.keys())))
+    for node_id in all_node_ids:
+        b_node = base_node_map.get(node_id)
+        t_node = target_node_map.get(node_id)
+        if b_node is None:
+            diffs.append(TraceDiff(path=f"trace.node.{node_id}.present", base=False, target=True))
+        elif t_node is None:
+            diffs.append(TraceDiff(path=f"trace.node.{node_id}.present", base=True, target=False))
+        elif b_node.get("matched") != t_node.get("matched"):
+            diffs.append(TraceDiff(
+                path=f"trace.node.{node_id}.matched",
+                base=b_node.get("matched"),
+                target=t_node.get("matched"),
+            ))
+
+    return diffs
+
+
+@router.get(
+    "/traces",
+    response_model=list[TraceSummary],
+    summary="List decision trace summaries",
+)
+async def list_traces(
+    request: Request,
+    limit: int = Query(100, ge=1, le=1000, description="Maximum traces to return (1–1000)"),
+    offset: int = Query(0, ge=0, description="Number of traces to skip (for pagination)"),
+) -> list[TraceSummary]:
+    """Return a paginated list of TraceSummary objects from the in-memory TraceStore.
+
+    Traces are ordered newest-first (by started_at descending).
+    Use ``offset`` to page through results; ``limit`` is capped at 1 000.
+    """
+    effective_limit = min(limit, 1000)
+    # Fetch enough to cover the offset window, then slice.
+    all_traces = request.app.state.trace_store.list_recent(limit=effective_limit + offset)
+    page = all_traces[offset: offset + effective_limit]
+
+    summaries: list[TraceSummary] = []
+    for trace in page:
+        primary = trace.decision_results[0] if trace.decision_results else None
+        summaries.append(TraceSummary(
+            trace_id=str(trace.id),
+            decision_id=(
+                str(primary.id)
+                if primary is not None
+                else (str(trace.decision_id) if trace.decision_id else None)
+            ),
+            flow_id=str(trace.flow_id),
+            status=primary.status.value if primary is not None else None,
+            outcome=primary.outcome.value if primary is not None else None,
+            action_type=(
+                primary.action.get("type")
+                if primary is not None and primary.action is not None
+                else None
+            ),
+            confidence=primary.confidence if primary is not None else None,
+            created_at=trace.started_at,
+            committed_at=trace.completed_at,
+        ))
+    return summaries
+
+
+@router.post(
+    "/compare",
+    response_model=CompareResponse,
+    summary="Compare two decision traces field-by-field",
+)
+async def compare_traces(body: CompareRequest, request: Request) -> CompareResponse:
+    """Return field-level diffs between two DecisionTrace objects.
+
+    Both traces are looked up in the in-memory TraceStore (with optional
+    LedgerProjector fallback).  Returns 404 when either trace is not found.
+
+    The ``diffs`` list is empty when the two traces are semantically identical
+    across all compared fields.
+    """
+    def _load_trace(trace_id: str, label: str) -> DecisionTrace:
+        try:
+            return request.app.state.trace_store.get(trace_id)
+        except TraceNotFoundError:
+            pass
+        ledger_projector = getattr(request.app.state, "ledger_projector", None)
+        if ledger_projector is not None:
+            projected = ledger_projector.project(trace_id)
+            if projected is not None:
+                return projected
+        raise HTTPException(status_code=404, detail=f"{label} trace '{trace_id}' not found")
+
+    base_trace = _load_trace(body.base_trace_id, "Base")
+    target_trace = _load_trace(body.target_trace_id, "Target")
+
+    return CompareResponse(
+        base_trace_id=body.base_trace_id,
+        target_trace_id=body.target_trace_id,
+        diffs=_compute_trace_diffs(base_trace, target_trace),
+    )
+
+
+@router.post(
+    "/simulate",
+    response_model=SimulateResponse,
+    summary="Simulate decision evaluation without side effects",
+)
+async def simulate_decision(body: SimulateRequest, request: Request) -> SimulateResponse:
+    """Re-evaluate an existing trace with optional signal overrides — no side effects.
+
+    The original signal is reconstructed from the source trace and the
+    signal_overrides (confidence, payload) are merged on top.  The flow
+    used is the one recorded in the source trace.
+
+    Guarantees:
+        - No Ledger commit
+        - No EventBus publish
+        - No ExecutionPublisher call
+        - No HumanGate persistence
+        - No TraceStore save
+
+    Returns 404 when the source trace or its flow is not found.
+    Returns 422 when the source trace contains no signals to replay.
+    """
+    try:
+        source_trace = request.app.state.trace_store.get(body.trace_id)
+    except TraceNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Trace '{body.trace_id}' not found")
+
+    if not source_trace.signals:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Trace '{body.trace_id}' contains no signals to replay",
+        )
+
+    # Find the flow by its deterministic UUID recorded in the trace.
+    all_flows = request.app.state.flow_registry.list_flows()
+    flow = next((f for f in all_flows if f.id == source_trace.flow_id), None)
+    if flow is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Flow for trace '{body.trace_id}' not found in registry",
+        )
+
+    original_signal = source_trace.signals[0]
+    sig_data = original_signal.model_dump()
+    sig_data["id"] = uuid4()
+    sig_data["idempotency_key"] = None  # clear to avoid any cache interaction
+
+    overrides = body.signal_overrides
+    if overrides is not None:
+        if overrides.confidence is not None:
+            sig_data["confidence"] = overrides.confidence
+        if overrides.payload is not None:
+            sig_data["payload"] = {**sig_data.get("payload", {}), **overrides.payload}
+
+    signal = Signal(**sig_data)
+
+    # Bare engine — no side-effect dependencies wired.
+    engine = DecisionRuntimeEngine()
+
+    try:
+        result, trace = engine.simulate(signal, flow)
+    except ConditionEvaluationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected simulation error: {exc}") from exc
+
+    return SimulateResponse(
+        mode="simulation",
+        source_trace_id=body.trace_id,
+        result=result,
+        trace=trace,
+        committed=False,
+        events_published=False,
+    )

@@ -114,8 +114,15 @@ edges:
     label: Standard Express Route
     priority: 0
 
-  - id: priority_to_fallback
+  - id: priority_to_standard
     source_node_id: shipment_priority_check
+    target_node_id: standard_priority_check
+    condition_expression: "outcome == 'fail'"
+    label: Not Express — Try Standard
+    priority: 1
+
+  - id: standard_to_fallback
+    source_node_id: standard_priority_check
     target_node_id: standard_routing_fallback
     condition_expression: "outcome == 'fail'"
     label: Standard Routing

@@ -13,6 +13,9 @@ Side-effect pipeline (all optional, injected via constructor):
 
 In strict mode the Ledger is the official commit gate: execution is never
 requested for a decision the Ledger has not accepted.
+
+simulate() reuses the same core evaluation path (_pure_evaluate) but skips
+all side effects (Ledger, EventBus, ExecutionPublisher, HumanGate, TraceStore).
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ from backend.app.models.execution import ExecutionRequest
 from backend.app.models.flow import DecisionFlow, DecisionNode, NodeType
 from backend.app.models.runtime import RuntimeState
 from backend.app.models.signal import Signal
+from backend.app.models.trace import DecisionTrace
 from backend.app.runtime.boundary_engine import BoundaryEngine
 from backend.app.runtime.condition_evaluator import ConditionEvaluationError, ConditionEvaluator
 from backend.app.runtime.human_gate_manager import HumanGateManager
@@ -71,18 +75,19 @@ class DecisionRuntimeEngine:
         """Run the decision evaluation pipeline for one signal against one flow.
 
         Steps:
-            1. Build evaluation context from the signal.
-            2. Evaluate all active DECISION nodes; collect matches.
-            3. If no match, select the FALLBACK node.
-            4. Apply the flow's resolution policy to pick the winner from matches.
-            5. Return a fully populated DecisionResult.
+            1. Run _pure_evaluate() — core logic with no side effects.
+            2. Create a persistent HumanGateRequest when status is pending_human.
+            3. In strict mode: commit to Ledger before dispatching execution.
+            4. For confirmed decisions: create ExecutionRequest, publish to EventBus
+               and ExecutionPublisher.
+            5. Persist trace to TraceStore and Ledger (parallel mode).
 
         Args:
             signal: The input signal to evaluate.
             flow:   The decision flow defining which nodes and conditions to apply.
 
         Returns:
-            A DecisionResult describing the selected node and evaluation metadata.
+            A fully populated DecisionResult describing the selected node and evaluation metadata.
 
         Raises:
             ConditionEvaluationError: When a node's condition expression is invalid.
@@ -95,6 +100,130 @@ class DecisionRuntimeEngine:
             _metrics.observe("decision_evaluate_duration_seconds", time.monotonic() - _eval_start)
             return result
 
+        final, evaluated_nodes = self._pure_evaluate(signal, flow)
+
+        if (
+            final.status == DecisionStatus.PENDING_HUMAN
+            and self._human_gate_manager is not None
+        ):
+            gate_request = self._human_gate_manager.create_request(final)
+            final = final.model_copy(update={"human_gate": gate_request})
+
+        # Strict mode: Ledger is the commit gate.  Must run BEFORE EventBus so
+        # execution is never requested for a decision the Ledger rejected.
+        if self._ledger_adapter is not None and self._ledger_mode == "strict":
+            commit_trace = self._trace_builder.create_trace(signal, flow, final, evaluated_nodes)
+            ledger_result = self._ledger_adapter.commit(commit_trace, final)
+            _metrics.increment("ledger_append_total", {"result": ledger_result.status.value})
+            if ledger_result.status != LedgerCommitStatus.ACCEPTED:
+                if ledger_result.status == LedgerCommitStatus.DUPLICATE:
+                    prior = self._recover_prior_result(ledger_result.event_ids, signal)
+                    if prior is not None:
+                        return _record(prior)
+                    error_msg = "Ledger commit failed: duplicate — prior result not recoverable"
+                else:
+                    error_msg = f"Ledger commit failed: {ledger_result.status.value}"
+                now = datetime.now(timezone.utc)
+                return _record(final.model_copy(update={
+                    "status": DecisionStatus.ERROR,
+                    "state": RuntimeState.FAILED,
+                    "error_message": error_msg,
+                    "updated_at": now,
+                }))
+
+        # Create ExecutionRequest and dispatch to publishers for confirmed decisions.
+        # Skipped in strict mode when ledger rejected (we already returned above).
+        if final.status == DecisionStatus.CONFIRMED:
+            exec_req = ExecutionRequest(
+                execution_id=str(uuid4()),
+                decision_id=str(final.id),
+                trace_id=str(final.trace_id),
+                action=final.action,
+            )
+            final = final.model_copy(update={"execution_id": exec_req.execution_id})
+            runtime_event = RuntimeEvent(
+                event_type=EventType.EXECUTION_REQUESTED,
+                flow_id=final.flow_id,
+                trace_id=final.trace_id,
+                decision_id=final.id,
+                payload={
+                    "execution_id": exec_req.execution_id,
+                    "decision_id": str(final.id),
+                    "action": final.action,
+                },
+            )
+            # EventBus: internal event record for observability and audit.
+            if self._event_bus is not None:
+                self._event_bus.publish(runtime_event)
+            # ExecutionPublisher: external hand-off to orchestrator.
+            if self._execution_publisher is not None:
+                self._execution_publisher.publish(runtime_event)
+
+        # In strict mode, persist the finalised result for future DUPLICATE recovery.
+        # Only done when the signal carries an idempotency_key and the store is wired.
+        if (
+            self._ledger_adapter is not None
+            and self._ledger_mode == "strict"
+            and signal.idempotency_key
+            and self._idempotency_store is not None
+        ):
+            self._idempotency_store.set(signal.idempotency_key, final)
+
+        # Build trace (after EventBus so execution_id is captured) and persist.
+        # Parallel mode ledger commit is fire-and-forget: failures never block result.
+        if self._trace_store is not None or (
+            self._ledger_adapter is not None and self._ledger_mode != "strict"
+        ):
+            trace = self._trace_builder.create_trace(signal, flow, final, evaluated_nodes)
+            if self._trace_store is not None:
+                self._trace_store.save(trace)
+            if self._ledger_adapter is not None and self._ledger_mode != "strict":
+                try:
+                    commit_result = self._ledger_adapter.commit(trace, final)
+                    _metrics.increment("ledger_append_total", {"result": commit_result.status.value})
+                except Exception:
+                    pass
+
+        return _record(final)
+
+    def simulate(self, signal: Signal, flow: DecisionFlow) -> tuple[DecisionResult, DecisionTrace]:
+        """Evaluate without any side effects — for View Core inspection and comparison.
+
+        Reuses _pure_evaluate() so evaluation logic is identical to evaluate().
+        No HumanGate is persisted, no Ledger commit, no EventBus publish,
+        no ExecutionPublisher call, no TraceStore save.
+
+        Args:
+            signal: The input signal to evaluate (may include caller-applied overrides).
+            flow:   The decision flow to evaluate against.
+
+        Returns:
+            (DecisionResult, DecisionTrace) — fully populated but never committed.
+        """
+        final, evaluated_nodes = self._pure_evaluate(signal, flow)
+        trace = self._trace_builder.create_trace(signal, flow, final, evaluated_nodes)
+        return final, trace
+
+    # ------------------------------------------------------------------ #
+    # Core evaluation — no side effects                                    #
+    # ------------------------------------------------------------------ #
+
+    def _pure_evaluate(
+        self, signal: Signal, flow: DecisionFlow
+    ) -> tuple[DecisionResult, list[dict[str, Any]]]:
+        """Core evaluation logic: signal → nodes → resolution → boundary → DecisionResult.
+
+        No side effects (no HumanGate, no Ledger, no EventBus, no TraceStore).
+        Shared by evaluate() and simulate() to guarantee identical logic paths.
+
+        Returns:
+            (DecisionResult, evaluated_nodes) where evaluated_nodes contains
+            per-node records collected during the run.
+
+        Raises:
+            ConditionEvaluationError: When a node's condition expression is invalid.
+            RuntimeError: When no active fallback node is present and no node matched.
+        """
         trace_id = uuid4()
         context = self._build_context(signal)
         evaluated_nodes: list[dict[str, Any]] = []
@@ -181,89 +310,7 @@ class DecisionRuntimeEngine:
                 "reason": br.reason,
             })
 
-        if (
-            final.status == DecisionStatus.PENDING_HUMAN
-            and self._human_gate_manager is not None
-        ):
-            gate_request = self._human_gate_manager.create_request(final)
-            final = final.model_copy(update={"human_gate": gate_request})
-
-        # Strict mode: Ledger is the commit gate.  Must run BEFORE EventBus so
-        # execution is never requested for a decision the Ledger rejected.
-        if self._ledger_adapter is not None and self._ledger_mode == "strict":
-            commit_trace = self._trace_builder.create_trace(signal, flow, final, evaluated_nodes)
-            ledger_result = self._ledger_adapter.commit(commit_trace, final)
-            _metrics.increment("ledger_append_total", {"result": ledger_result.status.value})
-            if ledger_result.status != LedgerCommitStatus.ACCEPTED:
-                if ledger_result.status == LedgerCommitStatus.DUPLICATE:
-                    prior = self._recover_prior_result(ledger_result.event_ids, signal)
-                    if prior is not None:
-                        return _record(prior)
-                    error_msg = "Ledger commit failed: duplicate — prior result not recoverable"
-                else:
-                    error_msg = f"Ledger commit failed: {ledger_result.status.value}"
-                now = datetime.now(timezone.utc)
-                return _record(final.model_copy(update={
-                    "status": DecisionStatus.ERROR,
-                    "state": RuntimeState.FAILED,
-                    "error_message": error_msg,
-                    "updated_at": now,
-                }))
-
-        # Create ExecutionRequest and dispatch to publishers for confirmed decisions.
-        # Skipped in strict mode when ledger rejected (we already returned above).
-        if final.status == DecisionStatus.CONFIRMED:
-            exec_req = ExecutionRequest(
-                execution_id=str(uuid4()),
-                decision_id=str(final.id),
-                trace_id=str(final.trace_id),
-                action=final.action,
-            )
-            final = final.model_copy(update={"execution_id": exec_req.execution_id})
-            runtime_event = RuntimeEvent(
-                event_type=EventType.EXECUTION_REQUESTED,
-                flow_id=final.flow_id,
-                trace_id=final.trace_id,
-                decision_id=final.id,
-                payload={
-                    "execution_id": exec_req.execution_id,
-                    "decision_id": str(final.id),
-                    "action": final.action,
-                },
-            )
-            # EventBus: internal event record for observability and audit.
-            if self._event_bus is not None:
-                self._event_bus.publish(runtime_event)
-            # ExecutionPublisher: external hand-off to orchestrator.
-            if self._execution_publisher is not None:
-                self._execution_publisher.publish(runtime_event)
-
-        # In strict mode, persist the finalised result for future DUPLICATE recovery.
-        # Only done when the signal carries an idempotency_key and the store is wired.
-        if (
-            self._ledger_adapter is not None
-            and self._ledger_mode == "strict"
-            and signal.idempotency_key
-            and self._idempotency_store is not None
-        ):
-            self._idempotency_store.set(signal.idempotency_key, final)
-
-        # Build trace (after EventBus so execution_id is captured) and persist.
-        # Parallel mode ledger commit is fire-and-forget: failures never block result.
-        if self._trace_store is not None or (
-            self._ledger_adapter is not None and self._ledger_mode != "strict"
-        ):
-            trace = self._trace_builder.create_trace(signal, flow, final, evaluated_nodes)
-            if self._trace_store is not None:
-                self._trace_store.save(trace)
-            if self._ledger_adapter is not None and self._ledger_mode != "strict":
-                try:
-                    commit_result = self._ledger_adapter.commit(trace, final)
-                    _metrics.increment("ledger_append_total", {"result": commit_result.status.value})
-                except Exception:
-                    pass
-
-        return _record(final)
+        return final, evaluated_nodes
 
     # ------------------------------------------------------------------ #
     # Internal helpers                                                     #
