@@ -239,3 +239,110 @@ def test_empty_action_allowed() -> None:
     assert result.selected_node_id == "no_action_node"
     assert result.action is None
     assert result.status == DecisionStatus.CONFIRMED
+
+
+# ------------------------------------------------------------------ #
+# Canonical contract field tests (Decision Runtime OS v2)             #
+# ------------------------------------------------------------------ #
+
+
+def test_canonical_decision_id_populated() -> None:
+    """decision_id is auto-populated as a string from the UUID id field."""
+    signal = _signal()
+    nodes = [_decision_node("n", condition=None), _fallback_node()]
+    result = DecisionRuntimeEngine().evaluate(signal, _flow(nodes))
+
+    assert result.decision_id == str(result.id)
+    assert isinstance(result.decision_id, str)
+    assert len(result.decision_id) > 0
+
+
+def test_canonical_signal_id_populated() -> None:
+    """signal_id is auto-populated as a string from source_signal_id."""
+    signal = _signal()
+    nodes = [_decision_node("n", condition=None), _fallback_node()]
+    result = DecisionRuntimeEngine().evaluate(signal, _flow(nodes))
+
+    assert result.signal_id == str(result.source_signal_id)
+    assert isinstance(result.signal_id, str)
+
+
+def test_canonical_decision_type_populated() -> None:
+    """decision_type is auto-populated from status when not explicitly set."""
+    signal = _signal()
+    nodes = [_decision_node("n", condition=None), _fallback_node()]
+    result = DecisionRuntimeEngine().evaluate(signal, _flow(nodes))
+
+    assert result.decision_type == result.status.value
+    assert isinstance(result.decision_type, str)
+    assert len(result.decision_type) > 0
+
+
+def test_canonical_selected_flow_id_populated() -> None:
+    """selected_flow_id is auto-populated as a string from flow_id UUID."""
+    signal = _signal()
+    nodes = [_decision_node("n", condition=None), _fallback_node()]
+    result = DecisionRuntimeEngine().evaluate(signal, _flow(nodes))
+
+    assert result.selected_flow_id == str(result.flow_id)
+    assert isinstance(result.selected_flow_id, str)
+
+
+def test_canonical_human_gate_required_false_when_no_gate() -> None:
+    """human_gate_required is False when human_gate is None."""
+    signal = _signal()
+    nodes = [_decision_node("n", condition=None), _fallback_node()]
+    result = DecisionRuntimeEngine().evaluate(signal, _flow(nodes))
+
+    assert result.human_gate is None
+    assert result.human_gate_required is False
+
+
+def test_canonical_payload_from_action() -> None:
+    """payload is populated from the selected node's action dict."""
+    action = {"type": "route", "target": "vip_queue"}
+    signal = _signal()
+    nodes = [_decision_node("n", condition=None, action=action), _fallback_node()]
+    result = DecisionRuntimeEngine().evaluate(signal, _flow(nodes))
+
+    assert result.payload == action
+
+
+def test_canonical_timestamp_populated() -> None:
+    """timestamp is auto-populated as an ISO-8601 string from evaluated_at."""
+    signal = _signal()
+    nodes = [_decision_node("n", condition=None), _fallback_node()]
+    result = DecisionRuntimeEngine().evaluate(signal, _flow(nodes))
+
+    assert result.timestamp == result.evaluated_at.isoformat()
+    assert isinstance(result.timestamp, str)
+
+
+def test_canonical_schema_version() -> None:
+    """schema_version defaults to 'decision-result/v1'."""
+    signal = _signal()
+    nodes = [_decision_node("n", condition=None), _fallback_node()]
+    result = DecisionRuntimeEngine().evaluate(signal, _flow(nodes))
+
+    assert result.schema_version == "decision-result/v1"
+
+
+def test_canonical_reason_populated_from_error_message() -> None:
+    """reason is populated from error_message when present."""
+    from backend.app.models.decision import DecisionResult, DecisionStatus, DecisionOutcome
+    from backend.app.models.runtime import RuntimeState
+    from uuid import uuid4
+
+    result = DecisionResult(
+        trace_id=uuid4(),
+        flow_id=uuid4(),
+        flow_version="1.0.0",
+        selected_node_id="fallback",
+        source_signal_id=uuid4(),
+        state=RuntimeState.CONFIRMED,
+        status=DecisionStatus.ERROR,
+        outcome=DecisionOutcome.ERROR,
+        error_message="Evaluation failed due to missing signal data.",
+    )
+
+    assert result.reason == "Evaluation failed due to missing signal data."

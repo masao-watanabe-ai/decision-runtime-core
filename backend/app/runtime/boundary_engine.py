@@ -17,7 +17,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.app.models.boundary import BoundaryResult
+from backend.app.models.boundary import BoundaryResult, RuntimeBoundaryResult
 from backend.app.models.decision import DecisionResult, DecisionStatus
 from backend.app.models.flow import DecisionFlow, NodeType
 from backend.app.models.signal import Signal
@@ -168,3 +168,21 @@ class BoundaryEngine:
             )
 
         return result
+
+
+def to_runtime_boundary_results(
+    boundary_results: list[BoundaryResult],
+) -> list[RuntimeBoundaryResult]:
+    """Convert a list of BoundaryResult to canonical RuntimeBoundaryResult objects.
+
+    Use this when producing output for downstream orchestrators or the ledger
+    that expect the canonical v2 boundary contract rather than the internal
+    BoundaryResult representation.
+
+    Args:
+        boundary_results: List returned by BoundaryEngine.apply().
+
+    Returns:
+        List of RuntimeBoundaryResult with canonical field names.
+    """
+    return [RuntimeBoundaryResult.from_boundary_result(br) for br in boundary_results]

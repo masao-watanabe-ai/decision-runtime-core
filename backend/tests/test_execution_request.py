@@ -5,6 +5,7 @@ from typing import Any
 from backend.app.integrations.event_bus import EventBus
 from backend.app.models.decision import DecisionStatus
 from backend.app.models.event import EventType
+from backend.app.models.execution import ExecutionResult
 from backend.app.models.flow import DecisionFlow, DecisionNode, NodeType
 from backend.app.models.signal import Signal, SignalValueType
 from backend.app.runtime.engine import DecisionRuntimeEngine
@@ -174,3 +175,68 @@ def test_execution_id_unique() -> None:
     events = bus.get_events()
     assert len(events) == 2
     assert events[0].payload["execution_id"] != events[1].payload["execution_id"]
+
+
+# ------------------------------------------------------------------ #
+# ExecutionResult linkage tests (Decision Runtime OS v2)              #
+# ------------------------------------------------------------------ #
+
+
+def test_execution_result_links_to_decision() -> None:
+    """ExecutionResult carries decision_id and trace_id from the DecisionResult."""
+    engine = DecisionRuntimeEngine(event_bus=EventBus())
+    result = engine.evaluate(_signal(), _confirmed_flow())
+
+    exec_result = ExecutionResult(
+        execution_id=result.execution_id,
+        decision_id=result.decision_id,
+        trace_id=str(result.trace_id),
+        status="succeeded",
+        output={"job_id": "job_001"},
+    )
+
+    assert exec_result.execution_id == result.execution_id
+    assert exec_result.decision_id == result.decision_id
+    assert exec_result.trace_id == str(result.trace_id)
+    assert exec_result.status == "succeeded"
+
+
+def test_execution_result_canonical_decision_id_matches() -> None:
+    """ExecutionResult.decision_id equals DecisionResult.decision_id (canonical str form)."""
+    engine = DecisionRuntimeEngine(event_bus=EventBus())
+    result = engine.evaluate(_signal(), _confirmed_flow())
+
+    exec_result = ExecutionResult(
+        execution_id=result.execution_id,
+        decision_id=result.decision_id,
+        trace_id=str(result.trace_id),
+        status="succeeded",
+    )
+
+    # Both use canonical string form — no UUID conversion needed
+    assert exec_result.decision_id == str(result.id)
+    assert exec_result.decision_id == result.decision_id
+
+
+def test_execution_result_output_defaults_empty() -> None:
+    """ExecutionResult.output defaults to an empty dict."""
+    exec_result = ExecutionResult(
+        execution_id="exec_001",
+        decision_id="dr_001",
+        trace_id="tr_001",
+        status="pending",
+    )
+    assert exec_result.output == {}
+    assert exec_result.timestamp is None
+
+
+def test_execution_result_with_timestamp() -> None:
+    """ExecutionResult.timestamp accepts ISO-8601 strings."""
+    exec_result = ExecutionResult(
+        execution_id="exec_002",
+        decision_id="dr_002",
+        trace_id="tr_002",
+        status="failed",
+        timestamp="2026-05-04T12:00:00+00:00",
+    )
+    assert exec_result.timestamp == "2026-05-04T12:00:00+00:00"

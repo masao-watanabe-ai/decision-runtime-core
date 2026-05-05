@@ -5,12 +5,12 @@ from uuid import uuid4
 
 import pytest
 
-from backend.app.models.boundary import BoundaryResult
+from backend.app.models.boundary import BoundaryResult, RuntimeBoundaryResult
 from backend.app.models.decision import DecisionOutcome, DecisionResult, DecisionStatus
 from backend.app.models.flow import DecisionFlow, DecisionNode, NodeType
 from backend.app.models.runtime import RuntimeState
 from backend.app.models.signal import Signal, SignalValueType
-from backend.app.runtime.boundary_engine import BoundaryEngine
+from backend.app.runtime.boundary_engine import BoundaryEngine, to_runtime_boundary_results
 
 
 # ------------------------------------------------------------------ #
@@ -243,3 +243,85 @@ def test_boundary_deterministic() -> None:
     assert br1[0].triggered == br2[0].triggered
     assert br1[0].severity == br2[0].severity
     assert br1[0].effect == br2[0].effect
+
+
+# ------------------------------------------------------------------ #
+# RuntimeBoundaryResult tests (Decision Runtime OS v2 canonical form) #
+# ------------------------------------------------------------------ #
+
+
+def test_runtime_boundary_result_from_triggered() -> None:
+    """RuntimeBoundaryResult.from_boundary_result maps triggered→not passed."""
+    br = BoundaryResult(
+        boundary_id="b1",
+        triggered=True,
+        severity="high",
+        effect="block",
+        reason="Value exceeded limit",
+    )
+    rbr = RuntimeBoundaryResult.from_boundary_result(br)
+
+    assert rbr.boundary_id == "b1"
+    assert rbr.passed is False
+    assert rbr.action == "block"
+    assert rbr.severity == "high"
+    assert rbr.reason == "Value exceeded limit"
+    assert rbr.payload == {}
+
+
+def test_runtime_boundary_result_from_not_triggered() -> None:
+    """RuntimeBoundaryResult.from_boundary_result maps not-triggered→passed=True."""
+    br = BoundaryResult(
+        boundary_id="b_safe",
+        triggered=False,
+        severity="low",
+        effect="allow",
+        reason="Condition not met",
+    )
+    rbr = RuntimeBoundaryResult.from_boundary_result(br)
+
+    assert rbr.passed is True
+    assert rbr.action == "allow"
+
+
+def test_runtime_boundary_result_payload_from_action() -> None:
+    """RuntimeBoundaryResult.payload is populated from BoundaryResult.action dict."""
+    action_payload = {"type": "redirect", "target": "alt_queue"}
+    br = BoundaryResult(
+        boundary_id="b_redir",
+        triggered=True,
+        severity="medium",
+        effect="redirect",
+        action=action_payload,
+        reason="Redirecting due to capacity",
+    )
+    rbr = RuntimeBoundaryResult.from_boundary_result(br)
+
+    assert rbr.payload == action_payload
+    assert rbr.action == "redirect"
+
+
+def test_to_runtime_boundary_results_converts_list() -> None:
+    """to_runtime_boundary_results converts a full list of BoundaryResult."""
+    signal = _signal()
+    nodes = [
+        _boundary_node("b_low", condition=None, severity="low", effect="allow"),
+        _boundary_node("b_high", condition=None, severity="high", effect="block"),
+    ]
+    flow = _flow(nodes)
+    result = _decision_result()
+
+    _, boundary_results = BoundaryEngine().apply(signal, flow, result)
+    runtime_results = to_runtime_boundary_results(boundary_results)
+
+    assert len(runtime_results) == 2
+    assert all(isinstance(r, RuntimeBoundaryResult) for r in runtime_results)
+    # both triggered (condition=None → always triggers)
+    assert all(r.passed is False for r in runtime_results)
+    actions = {r.action for r in runtime_results}
+    assert actions == {"allow", "block"}
+
+
+def test_to_runtime_boundary_results_empty_list() -> None:
+    """to_runtime_boundary_results handles an empty list."""
+    assert to_runtime_boundary_results([]) == []

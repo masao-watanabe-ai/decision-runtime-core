@@ -89,3 +89,53 @@ class BoundaryResult(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc),
         description="Wall-clock timestamp when boundary evaluation completed",
     )
+
+
+class RuntimeBoundaryResult(BaseModel):
+    """Canonical cross-system boundary result for Decision Runtime OS v2.
+
+    Provides a stable contract for orchestrators, ledgers, and audit systems.
+    Convertible from ``BoundaryResult`` via ``from_boundary_result()``.
+
+    Field mapping from BoundaryResult:
+        boundary_id → boundary_id
+        not triggered → passed   (passed=True means boundary was NOT violated)
+        effect → action          (the enforcement action: allow/block/escalate/…)
+        action → payload         (the action's data payload, if any)
+        severity → severity
+        reason → reason
+    """
+
+    boundary_id: str = Field(..., description="ID of the boundary node that was evaluated")
+    passed: bool = Field(
+        ...,
+        description="True when the boundary was satisfied (condition did NOT trigger)",
+    )
+    action: str = Field(
+        ...,
+        description="Enforcement action applied: allow/block/override/escalate/redirect",
+    )
+    reason: Optional[str] = Field(
+        None,
+        description="Human-readable explanation of the evaluation outcome",
+    )
+    severity: Optional[str] = Field(
+        None,
+        description="Severity level: critical/high/medium/low",
+    )
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Action data payload (populated when effect is override or redirect)",
+    )
+
+    @classmethod
+    def from_boundary_result(cls, br: BoundaryResult) -> "RuntimeBoundaryResult":
+        """Convert a BoundaryResult to a RuntimeBoundaryResult."""
+        return cls(
+            boundary_id=br.boundary_id,
+            passed=not br.triggered,
+            action=br.effect,
+            reason=br.reason,
+            severity=br.severity,
+            payload=br.action or {},
+        )

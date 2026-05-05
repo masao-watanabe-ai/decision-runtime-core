@@ -23,6 +23,7 @@ from backend.app.integrations.runtime_ledger_adapter import (
     RuntimeLedgerAdapter,
     StepType,
     _event_id,
+    decision_result_to_ledger_event,
 )
 from backend.app.models.decision import DecisionOutcome, DecisionResult, DecisionStatus
 from backend.app.models.flow import DecisionFlow, DecisionNode, NodeType
@@ -435,3 +436,99 @@ def test_engine_evaluate_twice_second_commit_is_duplicate() -> None:
     # Second evaluate creates a new trace (different trace_id / decision_id),
     # so the ledger should have more events — not duplicates.
     assert len(client.get_events()) > events_after_first
+
+
+# ------------------------------------------------------------------ #
+# decision_result_to_ledger_event tests (canonical standalone fn)     #
+# ------------------------------------------------------------------ #
+
+
+def _decision_result(
+    status: DecisionStatus = DecisionStatus.CONFIRMED,
+    outcome: DecisionOutcome = DecisionOutcome.PASS,
+) -> DecisionResult:
+    from backend.app.models.runtime import RuntimeState
+    return DecisionResult(
+        trace_id=uuid4(),
+        flow_id=uuid4(),
+        flow_version="1.0.0",
+        selected_node_id="some_node",
+        source_signal_id=uuid4(),
+        state=RuntimeState.CONFIRMED,
+        status=status,
+        outcome=outcome,
+    )
+
+
+def test_decision_result_to_ledger_event_required_keys() -> None:
+    """decision_result_to_ledger_event returns all required canonical keys."""
+    result = _decision_result(
+        status=DecisionStatus.CONFIRMED,
+        outcome=DecisionOutcome.PASS,
+    )
+    event = decision_result_to_ledger_event(result)
+
+    required_keys = {
+        "event_type", "schema_version", "decision_id", "signal_id",
+        "decision_type", "selected_flow_id", "outcome", "status",
+        "confidence", "reason", "human_gate_required", "payload",
+        "timestamp", "boundary_results",
+    }
+    assert required_keys.issubset(event.keys())
+
+
+def test_decision_result_to_ledger_event_type() -> None:
+    """event_type is always 'runtime.decision.produced'."""
+    result = _decision_result(status=DecisionStatus.CONFIRMED, outcome=DecisionOutcome.PASS)
+    event = decision_result_to_ledger_event(result)
+    assert event["event_type"] == "runtime.decision.produced"
+
+
+def test_decision_result_to_ledger_event_canonical_ids() -> None:
+    """decision_id matches DecisionResult.decision_id (canonical str form)."""
+    result = _decision_result(status=DecisionStatus.CONFIRMED, outcome=DecisionOutcome.PASS)
+    event = decision_result_to_ledger_event(result)
+    assert event["decision_id"] == result.decision_id
+    assert event["decision_id"] == str(result.id)
+
+
+def test_decision_result_to_ledger_event_schema_version() -> None:
+    """schema_version is 'decision-result/v1'."""
+    result = _decision_result(status=DecisionStatus.CONFIRMED, outcome=DecisionOutcome.PASS)
+    event = decision_result_to_ledger_event(result)
+    assert event["schema_version"] == "decision-result/v1"
+
+
+def test_decision_result_to_ledger_event_outcome_values() -> None:
+    """outcome and status are string values, not enum objects."""
+    result = _decision_result(status=DecisionStatus.FALLBACK, outcome=DecisionOutcome.FAIL)
+    event = decision_result_to_ledger_event(result)
+    assert event["outcome"] == "fail"
+    assert event["status"] == "fallback"
+    assert isinstance(event["outcome"], str)
+    assert isinstance(event["status"], str)
+
+
+def test_decision_result_to_ledger_event_boundary_results_serializable() -> None:
+    """boundary_results in ledger event are plain dicts, not model objects."""
+    from backend.app.models.boundary import BoundaryResult
+    from datetime import datetime, timezone
+
+    br = BoundaryResult(
+        boundary_id="b1",
+        triggered=True,
+        severity="high",
+        effect="block",
+        reason="Value exceeded limit",
+    )
+    result = _decision_result(status=DecisionStatus.BLOCKED, outcome=DecisionOutcome.FAIL)
+    result = result.model_copy(update={"boundary_results": [br]})
+    event = decision_result_to_ledger_event(result)
+
+    assert len(event["boundary_results"]) == 1
+    br_dict = event["boundary_results"][0]
+    assert isinstance(br_dict, dict)
+    assert br_dict["boundary_id"] == "b1"
+    assert br_dict["triggered"] is True
+    assert br_dict["effect"] == "block"
+    assert br_dict["severity"] == "high"

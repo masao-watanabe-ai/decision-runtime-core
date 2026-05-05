@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .boundary import BoundaryResult
 from .human_gate import HumanGateRequest
@@ -124,3 +124,69 @@ class DecisionResult(BaseModel):
         description="Timestamp of the most recent update to this record",
     )
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # ------------------------------------------------------------------
+    # Canonical cross-system contract fields (Decision Runtime OS v2)
+    # ------------------------------------------------------------------
+    # These fields provide a stable interface for downstream systems
+    # (orchestrator, ledger, audit) regardless of internal UUID types.
+    # Populated automatically by model_validator from existing fields.
+    # ------------------------------------------------------------------
+
+    decision_id: str = Field(
+        default="",
+        description="Canonical string decision identifier (derived from id)",
+    )
+    signal_id: Optional[str] = Field(
+        None,
+        description="Canonical string signal identifier (derived from source_signal_id)",
+    )
+    decision_type: str = Field(
+        default="",
+        description="Decision category (derived from status when not explicitly set)",
+    )
+    selected_flow_id: Optional[str] = Field(
+        None,
+        description="String flow identifier for orchestrator routing (derived from flow_id)",
+    )
+    reason: Optional[str] = Field(
+        None,
+        description="Human-readable reason for the decision outcome",
+    )
+    human_gate_required: bool = Field(
+        False,
+        description="True when human approval is required (derived from human_gate)",
+    )
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Decision payload for downstream execution (derived from action)",
+    )
+    timestamp: Optional[str] = Field(
+        None,
+        description="ISO-8601 evaluation timestamp (derived from evaluated_at)",
+    )
+    schema_version: str = Field(
+        "decision-result/v1",
+        description="Schema version for cross-system compatibility",
+    )
+
+    @model_validator(mode="after")
+    def _populate_canonical_fields(self) -> "DecisionResult":
+        """Auto-populate canonical fields from existing UUID-based fields."""
+        if not self.decision_id:
+            self.decision_id = str(self.id)
+        if self.signal_id is None:
+            self.signal_id = str(self.source_signal_id)
+        if not self.decision_type:
+            self.decision_type = self.status.value
+        if self.selected_flow_id is None:
+            self.selected_flow_id = str(self.flow_id)
+        if self.reason is None and self.error_message:
+            self.reason = self.error_message
+        # human_gate_required is always derived — consistent with human_gate presence
+        self.human_gate_required = self.human_gate is not None
+        if not self.payload and self.action:
+            self.payload = self.action
+        if self.timestamp is None:
+            self.timestamp = self.evaluated_at.isoformat()
+        return self

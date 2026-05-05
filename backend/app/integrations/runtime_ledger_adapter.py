@@ -316,3 +316,46 @@ class RuntimeLedgerAdapter:
 def _event_id(trace_id: UUID, step_key: str) -> UUID:
     """Derive a deterministic event UUID from trace_id and a step-specific key."""
     return uuid5(_LEDGER_NS, f"{trace_id}:{step_key}")
+
+
+def decision_result_to_ledger_event(decision_result: DecisionResult) -> dict:
+    """Convert a DecisionResult to a flat ledger event dict.
+
+    Produces a self-contained, JSON-serializable dict suitable for direct
+    appending to an append-only ledger without requiring a full DecisionTrace.
+    Carries all canonical cross-system fields from Decision Runtime OS v2.
+
+    Args:
+        decision_result: A DecisionResult produced by DecisionRuntimeEngine.
+
+    Returns:
+        A dict with event_type, schema_version, all canonical fields, and
+        boundary_results as a list of serialisable summaries.
+    """
+    boundary_summaries = [
+        {
+            "boundary_id": br.boundary_id,
+            "triggered": br.triggered,
+            "effect": br.effect,
+            "severity": br.severity,
+            "reason": br.reason,
+        }
+        for br in decision_result.boundary_results
+    ]
+
+    return {
+        "event_type": "runtime.decision.produced",
+        "schema_version": decision_result.schema_version,
+        "decision_id": decision_result.decision_id,
+        "signal_id": decision_result.signal_id,
+        "decision_type": decision_result.decision_type,
+        "selected_flow_id": decision_result.selected_flow_id,
+        "outcome": decision_result.outcome.value,
+        "status": decision_result.status.value,
+        "confidence": decision_result.confidence,
+        "reason": decision_result.reason,
+        "human_gate_required": decision_result.human_gate_required,
+        "payload": decision_result.payload,
+        "timestamp": decision_result.timestamp,
+        "boundary_results": boundary_summaries,
+    }
