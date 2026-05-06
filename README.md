@@ -534,3 +534,4 @@ See [docs/features.md](docs/features.md) for the full capability and limitation 
 
 MIT License
 test token
+token switch test 2026年 5月 6日 水曜日 09時02分46秒 JST
